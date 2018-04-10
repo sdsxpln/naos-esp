@@ -3,6 +3,7 @@
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 #include <nvs_flash.h>
 #include <string.h>
 
@@ -16,7 +17,16 @@
 #include "utils.h"
 #include "wifi.h"
 
-SemaphoreHandle_t naos_system_mutex;
+typedef enum {
+  NAOS_SYSTEM_EVENT_WIFI_CONNECTED,
+  NAOS_SYSTEM_EVENT_WIFI_DISCONNECTED,
+  NAOS_SYSTEM_EVENT_MQTT_CONNECTED,
+  NAOS_SYSTEM_EVENT_MQTT_DISCONNECTED,
+  NAOS_SYSTEM_EVENT_RESTART_WIFI,
+  NAOS_SYSTEM_EVENT_RESTART_MQTT
+} naos_system_event_t;
+
+QueueHandle_t naos_system_queue;
 
 static naos_status_t naos_system_status;
 
@@ -51,6 +61,7 @@ static const char *naos_system_status_string(naos_status_t status) {
 static void naos_system_set_status(naos_status_t status) {
   // get name
   const char *name = naos_system_status_string(status);
+  ESP_LOGI(NAOS_LOG_TAG, "naos_system_set_status: %s", name)
 
   // change state
   naos_system_status = status;
@@ -60,8 +71,6 @@ static void naos_system_set_status(naos_status_t status) {
 
   // notify task
   naos_task_notify(status);
-
-  ESP_LOGI(NAOS_LOG_TAG, "naos_system_set_status: %s", name)
 }
 
 static void naos_system_configure_wifi() {
@@ -99,9 +108,6 @@ static void naos_system_start_mqtt() {
 }
 
 static void naos_system_handle_command(const char *command) {
-  // acquire mutex
-  NAOS_LOCK(naos_system_mutex);
-
   // detect command
   bool ping = strcmp(command, "ping") == 0;
   bool restart_mqtt = strcmp(command, "restart-mqtt") == 0;
@@ -123,72 +129,21 @@ static void naos_system_handle_command(const char *command) {
 
   // handle wifi restart
   else if (restart_wifi) {
-    ESP_LOGI(NAOS_LOG_TAG, "naos_system_ble_callback: restart wifi");
+    ESP_LOGI(NAOS_LOG_TAG, "naos_system_handle_command: restart wifi");
 
-    switch (naos_system_status) {
-      case NAOS_NETWORKED: {
-        // stop task
-        naos_task_stop();
-
-        // stop manager
-        naos_manager_stop();
-
-        // fallthrough
-      }
-
-      case NAOS_CONNECTED: {
-        // stop mqtt client
-        naos_mqtt_stop();
-
-        // change state
-        naos_system_set_status(NAOS_DISCONNECTED);
-
-        // fallthrough
-      }
-
-      case NAOS_DISCONNECTED: {
-        // restart wifi
-        naos_system_configure_wifi();
-      }
-    }
+    // forward event
+    naos_system_event_t evt = NAOS_SYSTEM_EVENT_RESTART_WIFI;
+    xQueueSend(naos_system_queue, &evt, 0);
   }
 
   // handle mqtt restart
   else if (restart_mqtt) {
-    ESP_LOGI(NAOS_LOG_TAG, "naos_system_ble_callback: restart mqtt");
+    ESP_LOGI(NAOS_LOG_TAG, "naos_system_handle_command: restart mqtt");
 
-    switch (naos_system_status) {
-      case NAOS_NETWORKED: {
-        // stop task
-        naos_task_stop();
-
-        // stop manager
-        naos_manager_stop();
-
-        // change state
-        naos_system_set_status(NAOS_CONNECTED);
-
-        // fallthrough
-      }
-
-      case NAOS_CONNECTED: {
-        // stop mqtt client
-        naos_mqtt_stop();
-
-        // restart mqtt
-        naos_system_start_mqtt();
-
-        // fallthrough
-      }
-
-      case NAOS_DISCONNECTED: {
-        // do nothing if not yet connected
-      }
-    }
+    // forward event
+    naos_system_event_t evt = NAOS_SYSTEM_EVENT_RESTART_MQTT;
+    xQueueSend(naos_system_queue, &evt, 0);
   }
-
-  // release mutex
-  NAOS_UNLOCK(naos_system_mutex);
 }
 
 static char *naos_system_read_callback(naos_ble_char_t ch) {
@@ -262,21 +217,13 @@ static void naos_system_write_callback(naos_ble_char_t ch, const char *value) {
 }
 
 static void naos_system_wifi_callback(naos_wifi_status_t status) {
-  // acquire mutex
-  NAOS_LOCK(naos_system_mutex);
-
   switch (status) {
     case NAOS_WIFI_STATUS_CONNECTED: {
       ESP_LOGI(NAOS_LOG_TAG, "naos_system_wifi_callback: connected");
 
-      // check if connection is new
-      if (naos_system_status == NAOS_DISCONNECTED) {
-        // change sate
-        naos_system_set_status(NAOS_CONNECTED);
-
-        // start wifi
-        naos_system_start_mqtt();
-      }
+      // forward event
+      naos_system_event_t evt = NAOS_SYSTEM_EVENT_WIFI_CONNECTED;
+      xQueueSend(naos_system_queue, &evt, 0);
 
       break;
     }
@@ -284,51 +231,23 @@ static void naos_system_wifi_callback(naos_wifi_status_t status) {
     case NAOS_WIFI_STATUS_DISCONNECTED: {
       ESP_LOGI(NAOS_LOG_TAG, "naos_system_wifi_callback: disconnected");
 
-      // check if we have been networked
-      if (naos_system_status == NAOS_NETWORKED) {
-        // stop task
-        naos_task_stop();
-
-        // stop manager
-        naos_manager_stop();
-      }
-
-      // check if we have been connected
-      if (naos_system_status >= NAOS_CONNECTED) {
-        // stop mqtt
-        naos_mqtt_stop();
-
-        // change state
-        naos_system_set_status(NAOS_DISCONNECTED);
-      }
+      // forward event
+      naos_system_event_t evt = NAOS_SYSTEM_EVENT_WIFI_DISCONNECTED;
+      xQueueSend(naos_system_queue, &evt, 0);
 
       break;
     }
   }
-
-  // release mutex
-  NAOS_UNLOCK(naos_system_mutex);
 }
 
 static void naos_system_mqtt_callback(esp_mqtt_status_t status) {
-  // acquire mutex
-  NAOS_LOCK(naos_system_mutex);
-
   switch (status) {
     case ESP_MQTT_STATUS_CONNECTED: {
       ESP_LOGI(NAOS_LOG_TAG, "naos_system_mqtt_callback: connected");
 
-      // check if connection is new
-      if (naos_system_status == NAOS_CONNECTED) {
-        // change state
-        naos_system_set_status(NAOS_NETWORKED);
-
-        // setup manager
-        naos_manager_start();
-
-        // start task
-        naos_task_start();
-      }
+      // forward event
+      naos_system_event_t evt = NAOS_SYSTEM_EVENT_MQTT_CONNECTED;
+      xQueueSend(naos_system_queue, &evt, 0);
 
       break;
     }
@@ -336,24 +255,173 @@ static void naos_system_mqtt_callback(esp_mqtt_status_t status) {
     case ESP_MQTT_STATUS_DISCONNECTED: {
       ESP_LOGI(NAOS_LOG_TAG, "naos_system_mqtt_callback: disconnected");
 
-      // change state
-      naos_system_set_status(NAOS_CONNECTED);
-
-      // stop task
-      naos_task_stop();
-
-      // terminate manager
-      naos_manager_stop();
-
-      // restart mqtt
-      naos_system_start_mqtt();
+      // forward event
+      naos_system_event_t evt = NAOS_SYSTEM_EVENT_MQTT_DISCONNECTED;
+      xQueueSend(naos_system_queue, &evt, 0);
 
       break;
     }
   }
+}
 
-  // release mutex
-  NAOS_UNLOCK(naos_system_mutex);
+static void naos_system_task(void *_) {
+  // set initial state
+  naos_system_set_status(NAOS_DISCONNECTED);
+
+  // initially configure wifi
+  naos_system_configure_wifi();
+
+  // loop forever
+  for (;;) {
+    // receive next event
+    naos_system_event_t evt;
+    while (xQueueReceive(naos_system_queue, &evt, portMAX_DELAY) == pdTRUE) {
+      switch (evt) {
+        case NAOS_SYSTEM_EVENT_WIFI_CONNECTED: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_WIFI_CONNECTED");
+
+          // check if connection is new
+          if (naos_system_status == NAOS_DISCONNECTED) {
+            // change sate
+            naos_system_set_status(NAOS_CONNECTED);
+
+            // start mqtt
+            naos_system_start_mqtt();
+          }
+
+          break;
+        }
+
+        case NAOS_SYSTEM_EVENT_WIFI_DISCONNECTED: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_WIFI_DISCONNECTED");
+
+          // check if we have been networked
+          if (naos_system_status == NAOS_NETWORKED) {
+            // stop task
+            naos_task_stop();
+
+            // stop manager
+            naos_manager_stop();
+          }
+
+          // check if we have been connected
+          if (naos_system_status >= NAOS_CONNECTED) {
+            // stop mqtt
+            naos_mqtt_stop();
+
+            // change state
+            naos_system_set_status(NAOS_DISCONNECTED);
+          }
+
+          break;
+        }
+
+        case NAOS_SYSTEM_EVENT_MQTT_CONNECTED: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_MQTT_CONNECTED");
+
+          // check if connection is new
+          if (naos_system_status == NAOS_CONNECTED) {
+            // change state
+            naos_system_set_status(NAOS_NETWORKED);
+
+            // setup manager
+            naos_manager_start();
+
+            // start task
+            naos_task_start();
+          }
+
+          break;
+        }
+
+        case NAOS_SYSTEM_EVENT_MQTT_DISCONNECTED: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_MQTT_DISCONNECTED");
+
+          // change state
+          naos_system_set_status(NAOS_CONNECTED);
+
+          // stop task
+          naos_task_stop();
+
+          // terminate manager
+          naos_manager_stop();
+
+          // restart mqtt
+          naos_system_start_mqtt();
+
+          break;
+        }
+
+        case NAOS_SYSTEM_EVENT_RESTART_WIFI: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_RESTART_WIFI");
+
+          switch (naos_system_status) {
+            case NAOS_NETWORKED: {
+              // stop task
+              naos_task_stop();
+
+              // stop manager
+              naos_manager_stop();
+
+              // fallthrough
+            }
+
+            case NAOS_CONNECTED: {
+              // stop mqtt client
+              naos_mqtt_stop();
+
+              // change state
+              naos_system_set_status(NAOS_DISCONNECTED);
+
+              // fallthrough
+            }
+
+            case NAOS_DISCONNECTED: {
+              // restart wifi
+              naos_system_configure_wifi();
+            }
+          }
+
+          break;
+        }
+
+        case NAOS_SYSTEM_EVENT_RESTART_MQTT: {
+          ESP_LOGI(NAOS_LOG_TAG, "naos_system_task: NAOS_SYSTEM_EVENT_RESTART_MQTT");
+
+          switch (naos_system_status) {
+            case NAOS_NETWORKED: {
+              // stop task
+              naos_task_stop();
+
+              // stop manager
+              naos_manager_stop();
+
+              // change state
+              naos_system_set_status(NAOS_CONNECTED);
+
+              // fallthrough
+            }
+
+            case NAOS_CONNECTED: {
+              // stop mqtt client
+              naos_mqtt_stop();
+
+              // restart mqtt
+              naos_system_start_mqtt();
+
+              // fallthrough
+            }
+
+            case NAOS_DISCONNECTED: {
+              // do nothing if not yet connected
+            }
+          }
+
+          break;
+        }
+      }
+    }
+  }
 }
 
 void naos_system_init() {
@@ -364,8 +432,8 @@ void naos_system_init() {
     naos_delay(delay);
   }
 
-  // create mutex
-  naos_system_mutex = xSemaphoreCreateMutex();
+  // create queue
+  naos_system_queue = xQueueCreate(16, sizeof(naos_system_event_t));
 
   // initialize flash memory
   ESP_ERROR_CHECK(nvs_flash_init());
@@ -391,9 +459,7 @@ void naos_system_init() {
   // initialize OTA
   naos_update_init();
 
-  // set initial state
-  naos_system_set_status(NAOS_DISCONNECTED);
-
-  // initially configure wifi
-  naos_system_configure_wifi();
+  // create task
+  ESP_LOGI(NAOS_LOG_TAG, "naos_system_init: create task");
+  xTaskCreatePinnedToCore(naos_system_task, "naos-system", 2048, NULL, 2, NULL, 1);
 }

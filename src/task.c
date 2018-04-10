@@ -71,7 +71,7 @@ void naos_task_start() {
   // create task if loop is present
   if (naos_config()->loop_callback != NULL) {
     ESP_LOGI(NAOS_LOG_TAG, "naos_task_start: create task");
-    xTaskCreatePinnedToCore(naos_task_process, "naos-task", 8192, NULL, 2, &naos_task_ref, 1);
+    xTaskCreatePinnedToCore(naos_task_process, "naos-task", 8192, NULL, 3, &naos_task_ref, 1);
   }
 
   // release mutex
